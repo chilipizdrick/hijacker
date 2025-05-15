@@ -3,13 +3,19 @@
   rustPlatform,
   pipewire,
   llvmPackages,
+  fetchFromGitHub,
   ...
 }:
 rustPlatform.buildRustPackage {
   pname = "hijacker";
-  version = "0.1.0";
+  version = "0-unstable-2025-05-10";
 
-  src = ./.;
+  src = fetchFromGitHub {
+    owner = "chilipizdrick";
+    repo = "hijacker";
+    rev = "b53bebd2ccdabdf8a7b00ddf76b3bd15e53bcf8f";
+    sha256 = "sha256-yLkgufOoO/35IIerwSkrBMB+0L5Fq6XHQ6lWV+Ltv9Q=";
+  };
 
   useFetchCargoVendor = true;
   cargoHash = "sha256-vCWzhaHsk6lu+OgNkEQ4/NdPdWvIpIu1UJ9sITP8L7k=";
