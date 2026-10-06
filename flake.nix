@@ -1,43 +1,51 @@
 {
-  description = "hijacker2 nix flake";
+  description = "minimal flake template";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-parts.url = "github:hercules-ci/flake-parts";
     nix-github-actions = {
       url = "github:nix-community/nix-github-actions";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = inputs:
-    inputs.flake-parts.lib.mkFlake {inherit inputs;} {
-      systems = ["x86_64-linux"];
-      perSystem = {
-        pkgs,
-        lib,
-        ...
-      }: {
-        packages = rec {
-          hijacker2 = pkgs.callPackage ./package.nix {};
-          default = hijacker2;
+  outputs = {
+    self,
+    nixpkgs,
+    nix-github-actions,
+    ...
+  }: let
+    systems = [
+      "aarch64-darwin"
+      "aarch64-linux"
+      "x86_64-darwin"
+      "x86_64-linux"
+    ];
+    forAllSystems = nixpkgs.lib.genAttrs systems;
+    forAllPkgs = f: forAllSystems (system: let pkgs = nixpkgs.legacyPackages.${system}; in f pkgs);
+  in {
+    packages = forAllPkgs (pkgs: rec {
+      hijacker = pkgs.callPackage ./package.nix;
+      default = hijacker;
+    });
+
+    devShells = forAllPkgs (pkgs: {
+      default = with pkgs; let
+        libs = [
+          clang-tools
+          llvmPackages.libstdcxxClang
+          pipewire
+        ];
+      in
+        mkShell {
+          buildInputs =
+            [pkg-config]
+            ++ libs;
+          LD_LIBRARY_PATH = lib.makeLibraryPath libs;
+          CPATH = lib.makeSearchPathOutput "dev" "include" libs;
         };
+    });
 
-        devShells.default = pkgs.mkShell rec {
-          buildInputs = with pkgs; [
-            pkg-config
-
-            clang-tools
-            llvmPackages.libstdcxxClang
-
-            pipewire
-          ];
-
-          LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath buildInputs}";
-          CPATH = lib.makeSearchPathOutput "dev" "include" buildInputs;
-        };
-      };
-
-      flake.githubActions = inputs.nix-github-actions.lib.mkGithubMatrix {checks = inputs.self.packages;};
-    };
+    githubActions = nix-github-actions.lib.mkGithubMatrix {checks = self.packages;};
+  };
 }

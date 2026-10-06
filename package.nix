@@ -1,14 +1,15 @@
 {
+  lib,
   pipewire,
   pkg-config,
   rustPlatform,
   ...
 }:
 rustPlatform.buildRustPackage {
-  pname = "hijacker2";
-  version = "0.1.0";
+  pname = "hijacker";
+  version = "0.2.0";
 
-  src = ./.;
+  src = lib.cleanSource ./.;
   cargoLock.lockFile = ./Cargo.lock;
 
   nativeBuildInputs = [
