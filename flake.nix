@@ -16,8 +16,6 @@
     ...
   }: let
     systems = [
-      "aarch64-darwin"
-      "aarch64-linux"
       "x86_64-darwin"
       "x86_64-linux"
     ];
@@ -25,7 +23,7 @@
     forAllPkgs = f: forAllSystems (system: let pkgs = nixpkgs.legacyPackages.${system}; in f pkgs);
   in {
     packages = forAllPkgs (pkgs: rec {
-      hijacker = pkgs.callPackage ./package.nix;
+      hijacker = pkgs.callPackage ./package.nix {};
       default = hijacker;
     });
 
