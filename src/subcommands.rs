@@ -11,7 +11,7 @@ use crate::{
 };
 
 pub fn play(client: &PipewireClient, args: PlayArgs) -> anyhow::Result<()> {
-    let buffer_size_millis = args.audio_ring_buffer_size_millis.unwrap_or(2000);
+    let buffer_size_millis = args.audio_ring_buffer_size_millis.unwrap_or(1000);
     let audio_source =
         AudioFileStream::new(&args.file_path, Duration::from_millis(buffer_size_millis))
             .with_context(|| format!("failed to load audio file: {}", args.file_path))?;

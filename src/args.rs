@@ -36,7 +36,7 @@ pub struct PlayArgs {
     #[arg(short = 's', long = "source")]
     pub source_node_name: Option<String>,
 
-    /// Length of audio ring buffer in milliseconds. Use with caution! Buffer is 2 seconds long by default.
+    /// Length of audio ring buffer in milliseconds. Use with caution! Buffer is 1 second long by default.
     #[arg(short = 'b', long = "buffer-size")]
     pub audio_ring_buffer_size_millis: Option<u64>,
 }

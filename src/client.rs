@@ -346,24 +346,19 @@ impl Worker {
         self.registry
             .add_listener_local()
             .global({
-                let state = Rc::clone(&self.state);
-                let registry = self.registry.clone();
-                move |obj| Self::on_global_added(&registry, &state, obj)
+                let self_ = self.clone();
+                move |obj| self_.on_global_added(obj)
             })
             .global_remove({
-                let state = Rc::clone(&self.state);
-                move |id| Self::on_global_removed(&state, id)
+                let self_ = self.clone();
+                move |id| self_.on_global_removed(id)
             })
             .register()
     }
 
-    fn on_global_added(
-        registry: &RegistryRc,
-        state: &SharedWorkerState,
-        obj: &GlobalObject<&DictRef>,
-    ) {
-        let mut st = state.borrow_mut();
-        st.global_objects.insert(obj.id, obj.to_owned());
+    fn on_global_added(&self, obj: &GlobalObject<&DictRef>) {
+        let mut state = self.state.borrow_mut();
+        state.global_objects.insert(obj.id, obj.to_owned());
 
         match obj.type_ {
             ObjectType::Node => {
@@ -387,7 +382,7 @@ impl Worker {
                         .and_then(|p| p.get("application.process.id"))
                         .and_then(|p| p.parse().ok()),
                 };
-                st.snapshot.nodes.insert(node.id, node);
+                state.snapshot.nodes.insert(node.id, node);
             }
             ObjectType::Port => {
                 let props = obj.props.as_ref();
@@ -418,8 +413,9 @@ impl Worker {
                     channel,
                 };
 
-                st.snapshot.ports.insert(port_id, port);
-                st.snapshot
+                state.snapshot.ports.insert(port_id, port);
+                state
+                    .snapshot
                     .node_ports
                     .entry(parent_node_id)
                     .or_default()
@@ -459,7 +455,7 @@ impl Worker {
                     input_node: NodeId(in_n),
                     input_port: PortId(in_p),
                 };
-                st.snapshot.links.insert(link.id, link);
+                state.snapshot.links.insert(link.id, link);
             }
             ObjectType::Metadata => {
                 let is_default =
@@ -469,7 +465,7 @@ impl Worker {
                     return;
                 }
 
-                let metadata_proxy: pipewire::metadata::Metadata = match registry.bind(obj) {
+                let metadata_proxy: pipewire::metadata::Metadata = match self.registry.bind(obj) {
                     Ok(proxy) => proxy,
                     Err(e) => {
                         error!("failed to bind default metadata proxy: {e}");
@@ -477,7 +473,7 @@ impl Worker {
                     }
                 };
 
-                let state_ref = Rc::clone(state);
+                let state_ = Rc::clone(&self.state);
                 let listener = metadata_proxy
                     .add_listener_local()
                     .property(move |_, key, _, value| {
@@ -487,7 +483,7 @@ impl Worker {
 
                         let entry_name = parse_named_entry(value);
 
-                        let mut st = state_ref.borrow_mut();
+                        let mut st = state_.borrow_mut();
                         match key {
                             "default.configured.audio.sink" => {
                                 st.snapshot.metadata.default_configured_audio_sink = entry_name;
@@ -508,41 +504,41 @@ impl Worker {
                     })
                     .register();
 
-                st._default_metadata_proxy = Some(metadata_proxy);
-                st._default_metadata_listener = Some(listener);
+                state._default_metadata_proxy = Some(metadata_proxy);
+                state._default_metadata_listener = Some(listener);
             }
             _ => {}
         }
     }
 
-    fn on_global_removed(state: &SharedWorkerState, id: u32) {
-        let mut st = state.borrow_mut();
-        st.global_objects.remove(&id);
+    fn on_global_removed(&self, id: u32) {
+        let mut state = self.state.borrow_mut();
+        state.global_objects.remove(&id);
 
         let node_id = NodeId(id);
         let port_id = PortId(id);
         let link_id = LinkId(id);
 
-        st.snapshot.nodes.remove(&node_id);
-        st.snapshot.links.remove(&link_id);
-        st.active_links.remove(&link_id);
-        st.active_streams.remove(&node_id);
+        state.snapshot.nodes.remove(&node_id);
+        state.snapshot.links.remove(&link_id);
+        state.active_links.remove(&link_id);
+        state.active_streams.remove(&node_id);
 
-        if let Some(port) = st.snapshot.ports.remove(&port_id)
-            && let Some(ports) = st.snapshot.node_ports.get_mut(&port.node_id)
+        if let Some(port) = state.snapshot.ports.remove(&port_id)
+            && let Some(ports) = state.snapshot.node_ports.get_mut(&port.node_id)
         {
             ports.retain(|&p| p != port_id);
         }
-        st.snapshot.node_ports.remove(&node_id);
+        state.snapshot.node_ports.remove(&node_id);
 
-        if st
+        if state
             ._default_metadata_proxy
             .as_ref()
             .is_some_and(|p| p.upcast_ref().id() == id)
         {
-            st._default_metadata_proxy = None;
-            st._default_metadata_listener = None;
-            st.snapshot.metadata = DefaultMetadata::default();
+            state._default_metadata_proxy = None;
+            state._default_metadata_listener = None;
+            state.snapshot.metadata = DefaultMetadata::default();
         }
     }
 
