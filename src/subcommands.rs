@@ -11,8 +11,10 @@ use crate::{
 };
 
 pub fn play(client: &PipewireClient, args: PlayArgs) -> anyhow::Result<()> {
-    let audio_source = AudioFileStream::new(&args.file_path, Duration::from_millis(10))
-        .with_context(|| format!("failed to load audio file: {}", args.file_path))?;
+    let buffer_size_millis = args.audio_ring_buffer_size_millis.unwrap_or(2000);
+    let audio_source =
+        AudioFileStream::new(&args.file_path, Duration::from_millis(buffer_size_millis))
+            .with_context(|| format!("failed to load audio file: {}", args.file_path))?;
     debug!("created audio source: {audio_source:?}");
 
     let stream = client
@@ -84,8 +86,8 @@ pub fn clever_play(client: &PipewireClient, args: PlayArgs) -> anyhow::Result<()
         play(client, args)
     } else {
         let args = PlayArgs {
-            file_path: args.file_path,
             source_node_name: None,
+            ..args
         };
 
         debug!("playing with default audio source as reference");
