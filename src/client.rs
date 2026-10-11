@@ -6,10 +6,8 @@ use std::mem::size_of;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use log::error;
 use pipewire::context::ContextRc;
@@ -57,7 +55,6 @@ pub struct WorkerState {
     pending_syncs: HashMap<i32, SyncCallback>,
     active_streams: HashMap<NodeId, StreamRc>,
     active_stream_listeners: Vec<StreamListener<()>>,
-    active_stream_finished: Vec<(Arc<AtomicBool>, Option<Sender<()>>)>,
     active_links: HashMap<LinkId, pipewire::link::Link>,
     global_objects: HashMap<u32, GlobalObject<PropertiesBox>>,
     _default_metadata_proxy: Option<pipewire::metadata::Metadata>,
@@ -236,6 +233,7 @@ impl Drop for PipewireClient {
     }
 }
 
+#[derive(Clone)]
 pub struct Worker {
     mainloop: MainLoopRc,
     core: CoreRc,
@@ -267,86 +265,33 @@ impl Worker {
         let _reg_listener = self.setup_registry_listener();
         let _core_listener = self.setup_core_listener();
 
-        if let Err(e) = self.sync_barrier({
-            let ready_tx = ready_tx.clone();
-            move || {
-                let _ = ready_tx.send(Ok(()));
-            }
-        }) {
-            let _ = ready_tx.send(Err(PipewireError::Core(e)));
-            return;
-        }
+        self.sync_barrier_and_respond(ready_tx, ());
 
-        let mainloop = self.mainloop.clone();
-        let state = Rc::clone(&self.state);
-        let core = self.core.clone();
-
-        let timer_source = self.mainloop.loop_().add_timer({
-            let state = Rc::clone(&state);
-            move |_| {
-                let mut st = state.borrow_mut();
-                for (is_done, finish_tx) in &mut st.active_stream_finished {
-                    if is_done.load(Ordering::Acquire)
-                        && let Some(tx) = finish_tx.take()
-                    {
-                        let _ = tx.send(());
-                    }
-                }
-                st.active_stream_finished.retain(|(_, tx)| tx.is_some());
-            }
-        });
-        timer_source.update_timer(
-            Some(Duration::from_millis(20)),
-            Some(Duration::from_millis(20)),
-        );
-
+        let self_ = self.clone();
         let _cmd_listener = cmd_rx.attach(self.mainloop.loop_(), move |cmd| match cmd {
             Command::GetSnapshot(responder) => {
-                let snap = state.borrow().snapshot.clone();
+                let snap = self_.state.borrow().snapshot.clone();
                 let _ = responder.send(snap);
             }
             Command::SetStreamState { node_id, playing } => {
-                if let Some(stream) = state.borrow().active_streams.get(&node_id) {
+                if let Some(stream) = self_.state.borrow().active_streams.get(&node_id) {
                     let _ = stream.set_active(playing);
                 }
             }
             Command::DestroyStream(node_id) => {
-                state.borrow_mut().active_streams.remove(&node_id);
+                self_.state.borrow_mut().active_streams.remove(&node_id);
             }
             Command::CreateLink {
                 out_port,
                 in_port,
                 linger,
                 responder,
-            } => {
-                let link_res = Self::handle_create_link(&core, &state, out_port, in_port, linger);
-                let _ = responder.send(link_res);
-            }
+            } => self_.handle_create_link(out_port, in_port, linger, responder),
             Command::DestroyLink { link_id, responder } => {
-                state.borrow_mut().active_links.remove(&link_id);
-
-                if self
-                    .registry
-                    .destroy_global(link_id.0)
-                    .into_result()
-                    .is_err()
-                {
-                    let _ = responder.send(Err(PipewireError::LinkDestruction));
-                }
-
-                if let Ok(seq) = core.sync(0) {
-                    self.state.borrow_mut().pending_syncs.insert(
-                        seq.raw(),
-                        Box::new(move || {
-                            let _ = responder.send(Ok(()));
-                        }),
-                    );
-                } else {
-                    let _ = responder.send(Ok(()));
-                }
+                self_.handle_destroy_link(link_id, responder)
             }
             Command::Execute(func) => {
-                func(&mut state.borrow_mut(), &core);
+                func(&mut self_.state.borrow_mut(), &self_.core);
             }
             Command::CreateStream {
                 config,
@@ -354,9 +299,9 @@ impl Worker {
                 finish_tx,
                 responder,
             } => {
-                Self::handle_create_stream(&core, &state, config, source, finish_tx, responder);
+                self_.handle_create_stream(config, source, finish_tx, responder);
             }
-            Command::Shutdown => mainloop.quit(),
+            Command::Shutdown => self_.mainloop.quit(),
         });
 
         self.mainloop.run();
@@ -369,6 +314,20 @@ impl Worker {
             .pending_syncs
             .insert(seq.raw(), Box::new(callback));
         Ok(())
+    }
+
+    /// Performs core.sync(0) and if the sync was successfull, sends value to the caller thread.
+    /// If sync was unsuccessfull sends the value anyway.
+    fn sync_barrier_and_respond<T: 'static>(&self, responder: Sender<PWResult<T>>, value: T) {
+        let responder_ = responder.clone();
+
+        let sync_res = self.sync_barrier(move || {
+            let _ = responder_.send(Ok(value));
+        });
+
+        if let Err(err) = sync_res {
+            let _ = responder.send(Err(PipewireError::Core(err)));
+        }
     }
 
     fn setup_core_listener(&self) -> core::Listener {
@@ -384,18 +343,15 @@ impl Worker {
     }
 
     fn setup_registry_listener(&self) -> registry::Listener {
-        let state = Rc::clone(&self.state);
-        let registry = self.registry.clone();
-
         self.registry
             .add_listener_local()
             .global({
-                let state = Rc::clone(&state);
-                let registry = registry.clone();
+                let state = Rc::clone(&self.state);
+                let registry = self.registry.clone();
                 move |obj| Self::on_global_added(&registry, &state, obj)
             })
             .global_remove({
-                let state = Rc::clone(&state);
+                let state = Rc::clone(&self.state);
                 move |id| Self::on_global_removed(&state, id)
             })
             .register()
@@ -538,8 +494,6 @@ impl Worker {
                             }
                             "default.configured.audio.source" => {
                                 st.snapshot.metadata.default_configured_audio_source = entry_name;
-                                // let entry_name = serde_json::from_str::<NamedEntry>(value)
-                                //     .ok()
                             }
                             "default.audio.sink" => {
                                 st.snapshot.metadata.default_audio_sink = entry_name;
@@ -593,33 +547,59 @@ impl Worker {
     }
 
     fn handle_create_link(
-        core: &CoreRc,
-        state: &SharedWorkerState,
+        &self,
         out_port: PortId,
         in_port: PortId,
         linger: bool,
-    ) -> PWResult<LinkId> {
+        responder: Sender<PWResult<LinkId>>,
+    ) {
         let props = properties! {
             "link.output.port" => out_port.0.to_string(),
             "link.input.port" => in_port.0.to_string(),
             "object.linger" => if linger { "1" } else { "0" },
         };
 
-        let link_proxy = core
+        let link_proxy_res = self
+            .core
             .create_object::<pipewire::link::Link>("link-factory", &props)
-            .map_err(|e| PipewireError::LinkCreation(e.to_string()))?;
+            .map_err(|e| PipewireError::LinkCreation(e.to_string()));
+        let link_proxy = match link_proxy_res {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = responder.send(Err(err));
+                return;
+            }
+        };
 
         let link_id = LinkId(link_proxy.upcast_ref().id());
-        state.borrow_mut().active_links.insert(link_id, link_proxy);
-        Ok(link_id)
+        self.state
+            .borrow_mut()
+            .active_links
+            .insert(link_id, link_proxy);
+
+        self.sync_barrier_and_respond(responder, link_id);
+    }
+
+    fn handle_destroy_link(&self, link_id: LinkId, responder: Sender<PWResult<()>>) {
+        self.state.borrow_mut().active_links.remove(&link_id);
+
+        if self
+            .registry
+            .destroy_global(link_id.0)
+            .into_result()
+            .is_err()
+        {
+            let _ = responder.send(Err(PipewireError::LinkDestruction));
+        }
+
+        self.sync_barrier_and_respond(responder, ());
     }
 
     fn handle_create_stream(
-        core: &CoreRc,
-        state: &SharedWorkerState,
+        &self,
         config: StreamConfig,
         mut audio_source: Box<dyn AudioSource>,
-        finish_tx: Sender<()>,
+        stream_finished_tx: Sender<()>,
         responder: Sender<PWResult<NodeId>>,
     ) {
         let num_channels = audio_source.audio_info().channels();
@@ -630,7 +610,7 @@ impl Worker {
             *pipewire::keys::AUDIO_CHANNELS => num_channels.to_string(),
         };
 
-        let stream = match StreamRc::new(core.clone(), &config.name, stream_props) {
+        let stream = match StreamRc::new(self.core.clone(), &config.name, stream_props) {
             Ok(s) => s,
             Err(e) => {
                 let _ = responder.send(Err(PipewireError::StreamCreation(e.to_string())));
@@ -672,53 +652,31 @@ impl Worker {
             return;
         }
 
-        let is_done = Arc::new(AtomicBool::new(false));
-        state
-            .borrow_mut()
-            .active_stream_finished
-            .push((Arc::clone(&is_done), Some(finish_tx)));
-
-        let responder_cell = Rc::new(RefCell::new(Some(responder)));
-        let state_clone = Rc::clone(state);
-        let stream_clone = stream.clone();
-        let core_clone = core.clone();
+        let responder_ = responder.clone();
+        let stream_ = stream.clone();
+        let self_ = self.clone();
 
         let listener = match stream
             .add_local_listener()
             .state_changed(move |stream, _, old, new| match new {
                 StreamState::Streaming if old == StreamState::Paused => {
                     let node_id = NodeId(stream.node_id());
-                    state_clone
+                    self_
+                        .state
                         .borrow_mut()
                         .active_streams
-                        .insert(node_id, stream_clone.clone());
+                        .insert(node_id, stream_.clone());
 
-                    let state_inner = Rc::clone(&state_clone);
-                    let resp_cell = Rc::clone(&responder_cell);
-                    if let Ok(seq) = core_clone.sync(0) {
-                        state_inner.borrow_mut().pending_syncs.insert(
-                            seq.raw(),
-                            Box::new(move || {
-                                if let Some(resp) = resp_cell.borrow_mut().take() {
-                                    let _ = resp.send(Ok(node_id));
-                                }
-                            }),
-                        );
-                    } else if let Some(resp) = resp_cell.borrow_mut().take() {
-                        let _ = resp.send(Ok(node_id));
-                    }
+                    self_.sync_barrier_and_respond(responder_.clone(), node_id);
                 }
                 StreamState::Error(err_msg) => {
-                    if let Some(resp) = responder_cell.borrow_mut().take() {
-                        let _ = resp.send(Err(PipewireError::StreamCreation(err_msg.to_string())));
-                    }
+                    let _ =
+                        responder_.send(Err(PipewireError::StreamCreation(err_msg.to_string())));
                 }
                 StreamState::Unconnected => {
-                    if let Some(resp) = responder_cell.borrow_mut().take() {
-                        let _ = resp.send(Err(PipewireError::StreamCreation(
-                            "stream disconnected unexpectedly during setup".into(),
-                        )));
-                    }
+                    let _ = responder_.send(Err(PipewireError::StreamCreation(
+                        "stream disconnected unexpectedly during setup".into(),
+                    )));
                 }
                 _ => {}
             })
@@ -727,44 +685,51 @@ impl Worker {
                     return;
                 };
                 let data = &mut buf.datas_mut()[0];
-                let Some(slice) = data.data() else {
+                let Some(samples_slice) = data.data() else {
                     return;
                 };
-                let slice_len = slice.len();
+                let samples_slice_len = samples_slice.len();
 
-                // SAFETY:
-                let (prefix, f32_slice, suffix) = unsafe { slice.align_to_mut::<f32>() };
+                let (prefix, f32_samples_slice, suffix) =
+                    unsafe { samples_slice.align_to_mut::<f32>() };
                 if !prefix.is_empty() || !suffix.is_empty() {
                     error!("slice of u8 is not properly aligned or sized for f32");
                     return;
                 }
 
-                let (filled, empty) = audio_source.consumer().pop_partial_slice(f32_slice);
+                let (filled_samples_slice, empty_samples_slice) =
+                    audio_source.consumer().pop_partial_slice(f32_samples_slice);
 
-                if !empty.is_empty() {
-                    empty.fill(0.0);
+                if !empty_samples_slice.is_empty() {
+                    empty_samples_slice.fill(0.0);
                 }
 
-                if filled.is_empty() {
-                    is_done.store(true, Ordering::Release);
+                if filled_samples_slice.is_empty() {
+                    let _ = stream_finished_tx.send(());
                 }
 
                 let chunk = data.chunk_mut();
                 *chunk.offset_mut() = 0;
                 *chunk.stride_mut() = (size_of::<f32>() as u32 * num_channels) as i32;
-                *chunk.size_mut() = slice_len as u32;
+                *chunk.size_mut() = samples_slice_len as u32;
             })
             .register()
         {
             Ok(l) => l,
-            Err(e) => {
-                error!("failed to register stream listener: {e}");
+            Err(err) => {
+                let _ = responder.send(Err(PipewireError::StreamCreation(format!(
+                    "failed to register stream listener: {err}"
+                ))));
                 return;
             }
         };
 
-        state.borrow_mut().active_stream_listeners.push(listener);
-        let _ = core.sync(0);
+        self.state
+            .borrow_mut()
+            .active_stream_listeners
+            .push(listener);
+
+        let _ = self.core.sync(0);
     }
 }
 
