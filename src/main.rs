@@ -3,6 +3,6 @@ use hijacker::args::CliArgs;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let args = CliArgs::try_parse()?;
+    let args = CliArgs::parse();
     hijacker::run(args)
 }

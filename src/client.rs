@@ -26,7 +26,6 @@ use pipewire::spa::utils::dict::DictRef;
 use pipewire::stream::{StreamFlags, StreamListener, StreamRc, StreamState};
 use pipewire::types::ObjectType;
 use pipewire::{channel, spa};
-use serde::Deserialize;
 
 use crate::audio_source::AudioSource;
 use crate::types::{
@@ -67,6 +66,8 @@ pub struct WorkerState {
 
 type SharedWorkerState = Rc<RefCell<WorkerState>>;
 
+pub type ExecuteFn = Box<dyn FnOnce(&mut WorkerState, &CoreRc) + Send>;
+
 pub enum Command {
     GetSnapshot(Sender<ModelSnapshot>),
     CreateStream {
@@ -90,7 +91,7 @@ pub enum Command {
         link_id: LinkId,
         responder: Sender<PWResult<()>>,
     },
-    Execute(Box<dyn FnOnce(&mut WorkerState, &CoreRc) + Send>),
+    Execute(ExecuteFn),
     Shutdown,
 }
 
@@ -248,7 +249,6 @@ impl Worker {
         let props = properties! {
             "pipewire.client.name" => "hijacker",
             "media.category" => "Manager",
-            "pipewire.acess" => "all",
         };
         let context = ContextRc::new(&mainloop, Some(props))?;
         let core = context.connect_rc(None)?;
@@ -325,7 +325,12 @@ impl Worker {
             Command::DestroyLink { link_id, responder } => {
                 state.borrow_mut().active_links.remove(&link_id);
 
-                if let Err(_) = self.registry.destroy_global(link_id.0).into_result() {
+                if self
+                    .registry
+                    .destroy_global(link_id.0)
+                    .into_result()
+                    .is_err()
+                {
                     let _ = responder.send(Err(PipewireError::LinkDestruction));
                 }
 
@@ -524,14 +529,7 @@ impl Worker {
                             return 0;
                         };
 
-                        #[derive(Deserialize)]
-                        struct NamedEntry {
-                            name: String,
-                        }
-
-                        let entry_name = serde_json::from_str::<NamedEntry>(value)
-                            .ok()
-                            .map(|e| e.name);
+                        let entry_name = parse_named_entry(value);
 
                         let mut st = state_ref.borrow_mut();
                         match key {
@@ -540,6 +538,8 @@ impl Worker {
                             }
                             "default.configured.audio.source" => {
                                 st.snapshot.metadata.default_configured_audio_source = entry_name;
+                                // let entry_name = serde_json::from_str::<NamedEntry>(value)
+                                //     .ok()
                             }
                             "default.audio.sink" => {
                                 st.snapshot.metadata.default_audio_sink = entry_name;
@@ -646,7 +646,7 @@ impl Worker {
         let obj = pod::Object {
             type_: SPA_TYPE_OBJECT_Format,
             id: SPA_PARAM_EnumFormat,
-            properties: audio_source.audio_info().clone().into(),
+            properties: (*audio_source.audio_info()).into(),
         };
 
         let serializer =
@@ -685,9 +685,9 @@ impl Worker {
 
         let listener = match stream
             .add_local_listener()
-            .state_changed(move |s, _, old, new| match new {
+            .state_changed(move |stream, _, old, new| match new {
                 StreamState::Streaming if old == StreamState::Paused => {
-                    let node_id = NodeId(s.node_id());
+                    let node_id = NodeId(stream.node_id());
                     state_clone
                         .borrow_mut()
                         .active_streams
@@ -722,17 +722,23 @@ impl Worker {
                 }
                 _ => {}
             })
-            .process(move |s, _| {
-                let Some(mut buf) = s.dequeue_buffer() else {
+            .process(move |steam, _| {
+                let Some(mut buf) = steam.dequeue_buffer() else {
                     return;
                 };
                 let data = &mut buf.datas_mut()[0];
                 let Some(slice) = data.data() else {
                     return;
                 };
-
                 let slice_len = slice.len();
-                let f32_slice = bytemuck::cast_slice_mut(slice);
+
+                // SAFETY:
+                let (prefix, f32_slice, suffix) = unsafe { slice.align_to_mut::<f32>() };
+                if !prefix.is_empty() || !suffix.is_empty() {
+                    error!("slice of u8 is not properly aligned or sized for f32");
+                    return;
+                }
+
                 let (filled, empty) = audio_source.consumer().pop_partial_slice(f32_slice);
 
                 if !empty.is_empty() {
@@ -759,5 +765,34 @@ impl Worker {
 
         state.borrow_mut().active_stream_listeners.push(listener);
         let _ = core.sync(0);
+    }
+}
+
+fn parse_named_entry(object: &str) -> Option<String> {
+    let stripped_obj = object.trim().strip_circumfix("{", "}")?.trim();
+    let stripped_obj = stripped_obj.strip_suffix(',').unwrap_or(stripped_obj);
+    let mut prop_value = stripped_obj.split(':');
+    let prop = prop_value.next()?.trim().strip_circumfix('"', '"')?;
+    let entry = prop_value.next()?.trim().strip_circumfix('"', '"')?;
+    if prop == "name" {
+        Some(entry.into())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn parse_default_metadata_prop() {
+        let json = r#"
+            {
+                "name": "something",
+            }
+        "#;
+
+        assert_eq!(parse_named_entry(json), Some("something".to_string()));
     }
 }

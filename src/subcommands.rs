@@ -7,7 +7,6 @@ use crate::{
     args::{LinkArgs, PlayArgs},
     audio_source::AudioFileStream,
     client::PipewireClient,
-    notify::notify,
     types::{LinkToggleResult, ModelSnapshot, NodeId, NodeModel},
 };
 
@@ -26,6 +25,7 @@ pub fn play(client: &PipewireClient, args: PlayArgs) -> anyhow::Result<()> {
     debug!("created stream with node ID: {:?}", stream.node_id);
 
     let snapshot = client.snapshot();
+    debug!("got default metadata: {:?}", snapshot.metadata);
 
     let source_node_name = match args.source_node_name {
         Some(name) => name,
@@ -129,27 +129,6 @@ pub fn link(client: &PipewireClient, args: LinkArgs) -> anyhow::Result<()> {
                 "Unlinked '{}' -X-> '{}' (removed {count} connection(s))",
                 source_node.name, target_node.name
             );
-        }
-    }
-
-    match &outcome {
-        LinkToggleResult::Linked(ids) => {
-            let body = format!(
-                "Connected across {} channel(s)\n{} ➔ {}",
-                ids.len(),
-                source_node.name,
-                target_node.name
-            );
-
-            notify("Audio Link Created", &body, "audio-card");
-        }
-        LinkToggleResult::Unlinked(count) => {
-            let body = format!(
-                "Removed {} connection(s)\n{} ⇥✕⇤ {}",
-                count, source_node.name, target_node.name
-            );
-
-            notify("Audio Link Removed", &body, "audio-volume-muted");
         }
     }
 

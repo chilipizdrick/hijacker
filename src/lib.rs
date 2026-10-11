@@ -1,7 +1,6 @@
 pub mod args;
 pub mod audio_source;
 pub mod client;
-pub mod notify;
 pub mod subcommands;
 pub mod types;
 

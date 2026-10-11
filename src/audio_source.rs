@@ -75,8 +75,9 @@ impl AudioFileStream {
             audio_info.set_flags(AudioInfoRawFlags::UNPOSITIONED);
         }
 
-        let ring_buffer_size =
-            ring_buffer_length.as_millis() as usize * sample_rate as usize * channels.count();
+        let ring_buffer_size = (ring_buffer_length.as_secs_f64()
+            * sample_rate as f64
+            * channels.count() as f64) as usize;
         let (mut producer, consumer) = rtrb::RingBuffer::new(ring_buffer_size);
 
         let join_handle = thread::Builder::new()
